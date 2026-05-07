@@ -1,0 +1,6 @@
+mujoco=3.8.0
+numpy==1.26.4
+groundingdino-py==0.4.0
+robot_descriptions=2.0.0
+matplotlib=3.10.8
+mink=1.1.0

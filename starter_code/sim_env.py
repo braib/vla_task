@@ -1,280 +1,262 @@
+"""
+sim_env.py - MuJoCo environment for VLA pick-and-place
+"""
+
+import os, re, tempfile, warnings
 import numpy as np
-import pybullet as pb
-import pybullet_data as pd
-import time
-import math
+import mujoco
+import mujoco.viewer
+
+CAM_W, CAM_H = 640, 480
+CAM_FOVY     = 60.0
+DT           = 0.002
+IK_ITERS     = 300
+HOVER_OFFSET = 0.12
+EEF_SITE     = "eef_site"
+HOME_QPOS    = np.array([0, -0.785, 0, -2.356, 0, 1.571, 0.785, 0.04, 0.04])
 
 
-IMG_W, IMG_H = 640, 480
-FOV          = 60          # degrees
-NEAR, FAR    = 0.01, 10.0
+def _inject_eef_site(panda_xml_path: str) -> str:
+    import pathlib as _pl
+    with open(panda_xml_path, "r") as f:
+        xml = f.read()
+    # Make meshdir absolute so the patched XML can live in /tmp
+    asset_dir = str(_pl.Path(panda_xml_path).parent / "assets")
+    xml = re.sub(r'meshdir="[^"]*"', f'meshdir="{asset_dir}"', xml)
+    site_tag = f'\n      <site name="{EEF_SITE}" pos="0 0 0.105" size="0.005" rgba="1 0 0 1"/>'
+    xml = re.sub(r'(<body name="hand"[^>]*>)', r'\1' + site_tag, xml, count=1)
+    return xml
 
-CAM_EYE    = [0.0,  0.0,  3.0]   # position in world
-CAM_TARGET = [0.0,  0.0,  0.0]   # looking at table center
-CAM_UP     = [0.0,  1.0,  0.0]   # up vector
 
-OBJECTS = [
-    {"id": 1, "name": "red_cube",  "color": [1, 0, 0, 1], "shape": "box",  "length": 0.04, "width": 0.04, "height": 0.04 },
-    {"id": 2, "name": "blue_bowl", "color": [0, 0, 1, 1], "shape": "bowl", "radius": 0.2, "height": 0.04 },
-]
+def _build_scene(panda_xml_path: str, tmpdir: str) -> str:
+    asset_dir = os.path.dirname(panda_xml_path)
+    panda_content = _inject_eef_site(panda_xml_path)
+    panda_out = os.path.join(tmpdir, "panda_patched.xml")
+    with open(panda_out, "w") as f:
+        f.write(panda_content)
 
-MAX_ARM_REACH = 0.8  # 0.89 m # 855 mm 
-MIN_ARM_REACH = 0.2  # 0.15 m
+    scene = f"""
+<mujoco model="pick_and_place">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="{DT}" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <default>
+    <default class="object">
+      <geom condim="4" friction="1.0 0.005 0.0001" solimp="0.99 0.99 0.01" solref="0.01 1"/>
+    </default>
+  </default>
+  <include file="panda_patched.xml"/>
+  <worldbody>
+    <light name="lt_top" pos="0.5 0 2.5" dir="0 0 -1" diffuse="0.8 0.8 0.8" castshadow="false"/>
+    <light name="lt_side" pos="-0.5 0.5 1.5" dir="1 -0.5 -1" diffuse="0.3 0.3 0.3" castshadow="false"/>
+    <geom name="vla_floor" type="plane" size="3 3 0.1" pos="0 0 0" rgba="0.6 0.6 0.6 1" contype="1" conaffinity="1"/>
+    <body name="table" pos="0.5 0 0">
+      <geom name="table_top" type="box" size="0.4 0.4 0.02" pos="0 0 0.4" rgba="0.55 0.37 0.18 1" contype="1" conaffinity="1"/>
+      <geom type="cylinder" size="0.02 0.2" pos="-0.35 -0.35 0.2" rgba="0.45 0.3 0.15 1"/>
+      <geom type="cylinder" size="0.02 0.2" pos=" 0.35 -0.35 0.2" rgba="0.45 0.3 0.15 1"/>
+      <geom type="cylinder" size="0.02 0.2" pos="-0.35  0.35 0.2" rgba="0.45 0.3 0.15 1"/>
+      <geom type="cylinder" size="0.02 0.2" pos=" 0.35  0.35 0.2" rgba="0.45 0.3 0.15 1"/>
+    </body>
+    <body name="cam_body" pos="0.5 0 1.72">
+      <camera name="overhead_cam" fovy="{CAM_FOVY}" pos="0 0 0" euler="3.14159 0 0"/>
+    </body>
+    <body name="red_cube" pos="0.38 -0.10 0.445">
+      <freejoint/>
+      <geom class="object" type="box" size="0.025 0.025 0.025" rgba="0.9 0.1 0.1 1" mass="0.05"/>
+      <site name="red_cube" size="0.002" rgba="1 0 0 0"/>
+    </body>
+    <body name="green_cube" pos="0.55 0.05 0.445">
+      <freejoint/>
+      <geom class="object" type="box" size="0.025 0.025 0.025" rgba="0.1 0.8 0.1 1" mass="0.05"/>
+      <site name="green_cube" size="0.002" rgba="0 1 0 0"/>
+    </body>
+    <body name="yellow_cube" pos="0.62 -0.08 0.445">
+      <freejoint/>
+      <geom class="object" type="box" size="0.025 0.025 0.025" rgba="0.95 0.85 0.05 1" mass="0.05"/>
+      <site name="yellow_cube" size="0.002" rgba="1 1 0 0"/>
+    </body>
+    <body name="blue_bowl" pos="0.50 0.20 0.422">
+      <freejoint/>
+      <geom class="object" type="cylinder" size="0.055 0.005" pos="0 0 0" rgba="0.1 0.2 0.95 1" mass="0.10"/>
+      <geom class="object" type="cylinder" size="0.055 0.018" pos="0 0 0.013" rgba="0.1 0.2 0.95 0.25" mass="0.01" contype="0" conaffinity="0"/>
+      <site name="blue_bowl" size="0.002" rgba="0 0 1 0"/>
+    </body>
+    <body name="red_bowl" pos="0.35 0.18 0.422">
+      <freejoint/>
+      <geom class="object" type="cylinder" size="0.055 0.005" pos="0 0 0" rgba="0.9 0.15 0.15 1" mass="0.10"/>
+      <geom class="object" type="cylinder" size="0.055 0.018" pos="0 0 0.013" rgba="0.9 0.15 0.15 0.25" mass="0.01" contype="0" conaffinity="0"/>
+      <site name="red_bowl" size="0.002" rgba="1 0 0 0"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    path = os.path.join(tmpdir, "scene.xml")
+    with open(path, "w") as f:
+        f.write(scene)
+    return path
 
-TABLE_LENGTH = 3.0
-TABLE_WIDTH  = 2.5
-TABLE_HEIGHT = 0.6
-
-PLANE_GROUND = ["plane.urdf",              [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
-ROBOTIC_ARM  = ["franka_panda/panda.urdf", [0.0, 0.0, TABLE_HEIGHT], [0.0, 0.0, 0.0, 1.0]]
-
-def sample_workspace_pose(max_reach= 0.8, min_reach=0.2, seed=None):
-
-    rng = np.random.default_rng(seed)
-    
-    r_min_sq = min_reach ** 2
-    r_max_sq = max_reach ** 2
-    
-    r  = np.sqrt(rng.uniform(r_min_sq, r_max_sq))
-    theta = rng.uniform(0, 2 * np.pi)
-    
-    x = r * np.cos(theta)
-    y = r * np.sin(theta)
-    
-    return x, y
 
 class SimEnv:
-    def __init__(self, gui=True):
-        self.gui = gui
-        self.object_ids   = {}
+    def __init__(self, render: bool = True, random_seed=None):
+        self.render  = render
+        self._rng    = np.random.default_rng(random_seed)
+        self._tmpdir = tempfile.mkdtemp()
+        self._viewer = None
 
-        self.random_seed = 44
-        np.random.seed(self.random_seed)
+        try:
+            from robot_descriptions import panda_mj_description
+            panda_path = panda_mj_description.MJCF_PATH
+        except ImportError:
+            raise ImportError("Run: pip install robot_descriptions")
 
-        self._connect()
-        self._load_scene()
-        self._spawn_robot()
-        self._compute_intrinsics()
- 
-    def _connect(self):
-        mode = pb.GUI if self.gui else pb.DIRECT
-        self.client = pb.connect(mode)
-        pb.resetSimulation()
-        pb.setAdditionalSearchPath(pd.getDataPath())
-        pb.setGravity(0, 0, -9.81)
-        pb.setRealTimeSimulation(0)
+        scene_path   = _build_scene(panda_path, self._tmpdir)
+        self.model   = mujoco.MjModel.from_xml_path(scene_path)
+        self.data    = mujoco.MjData(self.model)
+        print(f"[SimEnv] nq={self.model.nq} nu={self.model.nu} nsite={self.model.nsite}")
 
-    def _load_scene(self):
-        self.ground_plane = pb.loadURDF(PLANE_GROUND[0], PLANE_GROUND[1], PLANE_GROUND[2])
-        table_col = pb.createCollisionShape(
-            pb.GEOM_BOX,
-            halfExtents=[TABLE_LENGTH / 2, TABLE_WIDTH / 2, TABLE_HEIGHT / 2]
-        )
-        table_vis = pb.createVisualShape(
-            pb.GEOM_BOX,
-            halfExtents=[TABLE_LENGTH / 2, TABLE_WIDTH / 2, TABLE_HEIGHT / 2],
-            rgbaColor=[0.7, 0.5, 0.3, 1]
-        )
-        self.table_id = pb.createMultiBody(
-            baseMass=0,
-            baseCollisionShapeIndex=table_col,
-            baseVisualShapeIndex=table_vis,
-            basePosition=[0.0, 0.0, TABLE_HEIGHT / 2]
-        )
-        self._spawn_objects()
-    
-    def _spawn_objects(self):
-        table_top_z = TABLE_HEIGHT
-        quat = [0, 0, 0, 1]
-
-        for obj in OBJECTS:
-            if obj["shape"] == "box":
-                fos = max(obj["length"], obj["width"])
-                x, y = sample_workspace_pose(
-                    max_reach=MAX_ARM_REACH - fos,
-                    min_reach=max(MIN_ARM_REACH + fos, 0.0),
-                    seed=self.random_seed + obj["id"]
-                )
-                col_id = pb.createCollisionShape(
-                    pb.GEOM_BOX,
-                    halfExtents=[obj["length"] / 2, obj["width"] / 2, obj["height"] / 2]
-                )
-                vis_id = pb.createVisualShape(
-                    pb.GEOM_BOX,
-                    halfExtents=[obj["length"] / 2, obj["width"] / 2, obj["height"] / 2],
-                    rgbaColor=obj["color"]
-                )
-                body_id = pb.createMultiBody(
-                    baseMass=0.1,
-                    baseCollisionShapeIndex=col_id,
-                    baseVisualShapeIndex=vis_id,
-                    basePosition=[x, y, table_top_z + obj["height"] / 2],
-                    baseOrientation=quat
-                )
-
-            elif obj["shape"] == "bowl":
-                fos = obj["radius"]
-                x, y = sample_workspace_pose(
-                    max_reach=MAX_ARM_REACH - fos,
-                    min_reach=max(MIN_ARM_REACH + fos, 0.0),
-                    seed=self.random_seed + obj["id"]
-                )
-                col_id = pb.createCollisionShape(
-                    pb.GEOM_CYLINDER, radius=obj["radius"], height=obj["height"]
-                )
-                vis_id = pb.createVisualShape(
-                    pb.GEOM_CYLINDER, radius=obj["radius"], length=obj["height"],
-                    rgbaColor=obj["color"]
-                )
-                body_id = pb.createMultiBody(
-                    baseMass=0.1,
-                    baseCollisionShapeIndex=col_id,
-                    baseVisualShapeIndex=vis_id,
-                    basePosition=[x, y, table_top_z + obj["height"] / 2],
-                    baseOrientation=quat
-                )
-            else:
-                continue
-
-            self.object_ids[obj["name"]] = body_id
-            for _ in range(100):
-                pb.stepSimulation()
-
-    def _spawn_robot(self):
-        self.robotic_arm     = pb.loadURDF(ROBOTIC_ARM[0], ROBOTIC_ARM[1], ROBOTIC_ARM[2], useFixedBase=True)
-        self.num_joints      = pb.getNumJoints(self.robotic_arm)
-
-        self.end_effector_id = None
-        for i in range(self.num_joints):
-            info = pb.getJointInfo(self.robotic_arm, i)
-            if info[12].decode() == "panda_hand":
-                self.end_effector_id = i
+        # Find EEF site
+        self._eef_id = -1
+        for i in range(self.model.nsite):
+            if mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_SITE, i) == EEF_SITE:
+                self._eef_id = i
                 break
-        if self.end_effector_id is None:
-            self.end_effector_id = self.num_joints - 1  # fallback
-        
-        print("Endeffector Id: ", self.end_effector_id)
-
-    def _compute_intrinsics(self):
-        aspect           = IMG_W / IMG_H
-        fov_v_rad        = 2 * math.atan(math.tan(math.radians(FOV / 2.0)) / aspect)
-        fx               = (IMG_W / 2.0) / math.tan(math.radians(FOV / 2.0))
-        fy               = (IMG_H / 2.0) / math.tan(fov_v_rad / 2.0)
-        self.K = np.array([
-            [fx,  0,  IMG_W / 2.0],
-            [ 0, fy,  IMG_H / 2.0],
-            [ 0,  0,  1          ]
-        ], dtype=np.float64)
-
-
-    def get_camera_data(self):
-
-        view_matrix = pb.computeViewMatrix(CAM_EYE, CAM_TARGET, CAM_UP)
-        proj_matrix = pb.computeProjectionMatrixFOV(
-            fov=FOV, aspect=IMG_W / IMG_H,
-            nearVal=NEAR, farVal=FAR
-        )
-        _, _, rgba, depth_buf, _ = pb.getCameraImage(
-            width=IMG_W, height=IMG_H,
-            viewMatrix=view_matrix,
-            projectionMatrix=proj_matrix,
-            renderer=pb.ER_TINY_RENDERER
-        )
-
-        # Convert RGBA → RGB
-        rgb = np.array(rgba, dtype=np.uint8).reshape(IMG_H, IMG_W, 4)[:, :, :3] # to drop alpha #  it controls transparency
-
-        # Linearise depth buffer → real metric depth
-        depth_raw = np.array(depth_buf, dtype=np.float32).reshape(IMG_H, IMG_W)
-        depth = FAR * NEAR / (FAR - (FAR - NEAR) * depth_raw)
-
-        return rgb, depth, self.K
-
-    def move_to_pose(self, x, y, z, roll=0.0, pitch=0.0, yaw=0.0):
-        target_pos = [x, y, z]
-        target_orn = pb.getQuaternionFromEuler([roll, pitch, yaw])
-
-        joint_poses = pb.calculateInverseKinematics(
-            self.robotic_arm,        # was self.robot_id
-            self.end_effector_id,    # was self.ee_index
-            target_pos,
-            target_orn,
-            maxNumIterations=200,
-            residualThreshold=1e-5
-        )
-
-        for i in range(min(len(joint_poses), self.num_joints)):
-            pb.setJointMotorControl2(
-                bodyIndex=self.robotic_arm,
-                jointIndex=i,
-                controlMode=pb.POSITION_CONTROL,
-                targetPosition=joint_poses[i],
-                force=500
-            )
-
-        for _ in range(240):
-            pb.stepSimulation()
-            if self.gui:
-                time.sleep(1.0 / 240.0)
-
-    def set_gripper(self, is_open: bool):
-        state = "OPEN" if is_open else "CLOSED" 
-        print(f"[Gripper] {state}")
-        if not is_open:
-            self._attach_object()
+        if self._eef_id < 0:
+            warnings.warn("[SimEnv] EEF site not found; using hand body")
+            self._hand_id = self.model.body("hand").id
         else:
-            self._detach_object()
+            self._hand_id = None
+            print(f"[SimEnv] EEF site found (id={self._eef_id})")
 
-        for _ in range(60):
-            pb.stepSimulation()
-            if self.gui:
-                time.sleep(1.0 / 240.0)
+        if random_seed is not None:
+            self._randomise_objects()
 
-    def _attach_object(self):
-        link_state = pb.getLinkState(self.robotic_arm, self.end_effector_id)
-        ee_pos = link_state[4]
-        best_id, best_dist = None, float("inf")
-        for name, body_id in self.object_ids.items():
-            pos, _ = pb.getBasePositionAndOrientation(body_id)
-            d = math.dist(ee_pos, pos)
-            if d < best_dist:
-                best_dist = d
-                best_id   = body_id
-                self._held_name = name
+        self.reset()
+        self._renderer = mujoco.Renderer(self.model, height=CAM_H, width=CAM_W)
 
-        if best_id is not None and best_dist < 0.1:
-            self._constraint = pb.createConstraint(
-                parentBodyUniqueId=self.robotic_arm,     # fixed
-                parentLinkIndex=self.end_effector_id,    # fixed
-                childBodyUniqueId=best_id,
-                childLinkIndex=-1,
-                jointType=pb.JOINT_FIXED,
-                jointAxis=[0, 0, 0],
-                parentFramePosition=[0, 0, 0],
-                childFramePosition=[0, 0, 0]
-            )
-            print(f"[Gripper] Grasped: {self._held_name}")
-        else:
-            self._constraint = None
-            self._held_name  = None
-            print("[Gripper] Nothing within reach to grasp.")
+        if render:
+            self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            self._viewer.cam.lookat[:] = [0.5, 0.0, 0.42]
+            self._viewer.cam.distance  = 1.5
+            self._viewer.cam.elevation = -30
+            self._viewer.cam.azimuth   = 180
 
-    def _detach_object(self):
-        if hasattr(self, "_constraint") and self._constraint is not None:
-            pb.removeConstraint(self._constraint)
-            self._constraint = None
-            print(f"[Gripper] Released: {getattr(self, '_held_name', '?')}")
-            self._held_name = None
+        print("[SimEnv] Ready.")
+
+    def _randomise_objects(self):
+        z_map = {"blue_bowl": 0.422, "red_bowl": 0.422}
+        placed = []
+        for name in ["red_cube", "green_cube", "yellow_cube", "blue_bowl", "red_bowl"]:
+            z = z_map.get(name, 0.445)
+            for _ in range(300):
+                x = self._rng.uniform(0.22, 0.72)
+                y = self._rng.uniform(-0.30, 0.30)
+                pos = np.array([x, y, z])
+                if all(np.linalg.norm(pos[:2] - p[:2]) > 0.13 for p in placed):
+                    placed.append(pos); break
+            try:
+                jnt_id   = self.model.joint(name).id
+                adr      = self.model.jnt_qposadr[jnt_id]
+                self.data.qpos[adr:adr+3]   = pos
+                self.data.qpos[adr+3:adr+7] = [1,0,0,0]
+            except Exception:
+                pass
+
+    def reset(self):
+        mujoco.mj_resetData(self.model, self.data)
+        n = min(len(HOME_QPOS), self.model.nq)
+        self.data.qpos[:n] = HOME_QPOS[:n]
+        n_ctrl = min(8, self.model.nu)
+        self.data.ctrl[:n_ctrl] = HOME_QPOS[:n_ctrl]
+        mujoco.mj_forward(self.model, self.data)
+
+    def step(self, n: int = 1):
+        for _ in range(n):
+            mujoco.mj_step(self.model, self.data)
+        if self._viewer is not None and self._viewer.is_running():
+            self._viewer.sync()
 
     def close(self):
-        pb.disconnect()
+        if self._viewer is not None:
+            try: self._viewer.close()
+            except: pass
+        self._renderer.close()
 
-def main():
+    # ── Camera API ──────────────────────────────────────────────────────────
 
-    env = SimEnv(gui=True)
-    rgb, depth, K = env.get_camera_data()
-    time.sleep(100)
-    env.close()
+    def get_camera_image(self):
+        self._renderer.update_scene(self.data, camera="overhead_cam")
+        rgb = self._renderer.render().copy()
 
-if __name__=="__main__":
-    main()
+        self._renderer.enable_depth_rendering()
+        self._renderer.update_scene(self.data, camera="overhead_cam")
+        depth_raw = self._renderer.render().copy()
+        self._renderer.disable_depth_rendering()
+
+        extent = self.model.stat.extent
+        znear  = self.model.vis.map.znear * extent
+        zfar   = self.model.vis.map.zfar  * extent
+        denom  = zfar - depth_raw * (zfar - znear)
+        denom  = np.where(np.abs(denom) < 1e-6, 1e-6, denom)
+        depth  = (znear * zfar / denom).astype(np.float32)
+
+        K = self._intrinsics()
+        return rgb, depth, K
+
+    def _intrinsics(self):
+        fovy_rad = np.deg2rad(CAM_FOVY)
+        fy = (CAM_H / 2.0) / np.tan(fovy_rad / 2.0)
+        fx = fy * CAM_W / CAM_H
+        return np.array([[fx, 0, CAM_W/2], [0, fy, CAM_H/2], [0, 0, 1]], dtype=np.float64)
+
+    # ── Robot Control API ───────────────────────────────────────────────────
+
+    def move_to_pose(self, x, y, z, roll=0., pitch=0., yaw=0., **kw):
+        import mink
+        from scipy.spatial.transform import Rotation
+
+        configuration = mink.Configuration(self.model)
+        configuration.update(self.data.qpos)
+
+        frame_type = "site" if self._eef_id >= 0 else "body"
+        frame_name = EEF_SITE if self._eef_id >= 0 else "hand"
+
+        eef_task = mink.FrameTask(
+            frame_name=frame_name, frame_type=frame_type,
+            position_cost=1.0, orientation_cost=0.3,
+        )
+        R_mat  = Rotation.from_euler("xyz", [roll, pitch, yaw]).as_matrix()
+        target = mink.SE3.from_rotation_and_translation(
+            mink.SO3.from_matrix(R_mat), np.array([x, y, z])
+        )
+        eef_task.set_target(target)
+        limits = [mink.ConfigurationLimit(self.model)]
+
+        dt = DT * 20
+        converged = False
+        for _ in range(IK_ITERS):
+            configuration.update(self.data.qpos)
+            try:
+                # vel = mink.solve_ik(configuration, [eef_task], dt, limits=limits, damping=1e-3)
+                vel = mink.solve_ik(configuration, [eef_task], dt, solver="quadprog", limits=limits, damping=1e-3)
+            except Exception as e:
+                warnings.warn(f"[SimEnv] IK error: {e}"); break
+            configuration.integrate_inplace(vel, dt)
+            self.data.ctrl[:7] = configuration.q[:7]
+            self.step(10)
+            pos_err = np.linalg.norm(eef_task.compute_error(configuration)[:3])
+            if pos_err < 8e-3:
+                converged = True; break
+        return converged
+
+    def set_gripper(self, open: bool):
+        pos = 0.04 if open else 0.001
+        for i in range(7, self.model.nu):
+            self.data.ctrl[i] = pos
+        self.step(200)
+
+    def get_eef_position(self):
+        if self._eef_id >= 0:
+            return self.data.site_xpos[self._eef_id].copy()
+        return self.data.xpos[self._hand_id].copy()
+
+    def get_object_position(self, name: str):
+        return self.data.xpos[self.model.body(name).id].copy()
