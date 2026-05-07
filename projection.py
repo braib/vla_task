@@ -41,12 +41,12 @@ import numpy as np
 # Overhead camera body position in world frame (metres)
 _CAM_WORLD_POS = np.array([0.5, 0.0, 1.72])
 
-# Overhead camera looks straight down → euler (π, 0, 0) in MuJoCo convention.
-# In MuJoCo, euler="π 0 0" means Rx(π): camera Z-axis points world -Z,
-# camera X = world X, camera Y = world -Y.
+# Overhead camera: euler="0 0 0" (camera body above table, default orientation).
+# MuJoCo camera default: optical axis = -Z of camera frame.
+# With euler=0: cam_X = world_X, cam_Y = world_Y (but image rows go DOWN = -Y),
+#               cam_Z = world_-Z (depth is positive downward).
 #
-# The resulting rotation matrix R_cam_to_world:
-#   world_pt = cam_pos + R @ cam_pt
+# Rotation matrix R_cam_to_world (s.t. world_pt = cam_pos + R @ cam_pt):
 _CAM_R = np.array([
     [ 1,  0,  0],   # camera X  → world +X
     [ 0, -1,  0],   # camera Y  → world -Y  (image rows go down = world -Y)
