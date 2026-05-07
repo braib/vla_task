@@ -42,7 +42,7 @@ HOME_CTRL  = np.array([0, 0, 0, -1.5708, 0, 1.5708, -0.7853, 255.0])
 # ctrl[7]=0   = fingers CLOSED
 
 # Arm folded backward — verified: no links above table surface
-PHOTO_QPOS = np.array([0, -1.8, 0, -0.3, 0, 1.5, -0.7853, 0.04, 0.04])
+PHOTO_QPOS = np.array([0, 0, 0, 0, 0, 1.57, 0, 0, 0])
 
 # ── IK parameters ────────────────────────────────────────────────────────────
 IK_DT        = 0.002          # IK integration step = 1 physics step
