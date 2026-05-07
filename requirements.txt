@@ -1,6 +1,22 @@
-mujoco=3.8.0
-numpy==1.26.4
-groundingdino-py==0.4.0
-robot_descriptions=2.0.0
-matplotlib=3.10.8
-mink=1.1.0
+# ── Core simulation ────────────────────────────────────────────────────────────
+mujoco>=3.2.0
+robot_descriptions>=1.10.0     # loads Panda MJCF from mujoco_menagerie
+
+# ── IK ─────────────────────────────────────────────────────────────────────────
+mink>=1.1.0
+
+# ── Perception ─────────────────────────────────────────────────────────────────
+numpy>=1.24.0
+opencv-python>=4.8.0
+scipy>=1.11.0
+
+# ── Optional: Grounding DINO (local VLM grounding, no API key needed) ──────────
+# If you want GPU-accelerated Grounding DINO, install PyTorch first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Then uncomment:
+# groundingdino-py>=0.4.0
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+Pillow>=10.0.0

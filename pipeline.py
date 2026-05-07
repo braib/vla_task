@@ -17,9 +17,6 @@ import numpy as np
 import cv2
 
 # ── Allow sim_env to live in starter_code/ ───────────────────────────────────
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "starter_code"))
-
 from starter_code.sim_env       import SimEnv
 from perception    import parse_prompt, detect_objects
 from projection    import pixel_to_world, project_to_table, get_camera_extrinsics
@@ -174,7 +171,8 @@ def run_task(
     detection = detect_objects(rgb, target_desc, dest_desc)
 
     if save_debug and detection.debug_image is not None:
-        fname = f"output/perception_view.png"
+        ts    = int(time.time())
+        fname = f"debug_{ts}.png"
         cv2.imwrite(fname, cv2.cvtColor(detection.debug_image, cv2.COLOR_RGB2BGR))
         print(f"[pipeline] Debug image → {fname}")
 
