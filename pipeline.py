@@ -11,15 +11,13 @@ Usage
   python pipeline.py --demo --record                        # two prompts + record
 """
 
-from __future__ import annotations
-import argparse, sys, os, time
+import argparse, sys, time
 import numpy as np
 import cv2
 
-# ── Allow sim_env to live in starter_code/ ───────────────────────────────────
-from starter_code.sim_env       import SimEnv
-from perception    import parse_prompt, detect_objects
-from projection    import pixel_to_world, project_to_table, get_camera_extrinsics
+from starter_code.sim_env import SimEnv
+from perception import parse_prompt, detect_objects
+from projection import estimate_object_from_depth, get_camera_extrinsics
 from robot_control import RobotController
 
 # ── Video recording ───────────────────────────────────────────────────────────
@@ -27,17 +25,6 @@ RECORD_W    = 1280
 RECORD_H    = 720
 RECORD_FPS  = 30
 RECORD_SKIP = 3      # capture 1 frame every N physics steps
-
-TABLE_Z, CUBE_Z, BOWL_Z = 0.42, 0.445, 0.425
-
-BODY_NAME_MAP = {
-    ("red",    "cube"):  "red_cube",   ("red",    None): "red_cube",
-    ("green",  "cube"):  "green_cube", ("green",  None): "green_cube",
-    ("yellow", "cube"):  "yellow_cube",("yellow", None): "yellow_cube",
-    ("blue",   "bowl"):  "blue_bowl",  ("blue",   None): "blue_bowl",
-    ("red",    "bowl"):  "red_bowl",
-}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Video recorder — wraps MuJoCo renderer, captures frames on every step
@@ -75,29 +62,68 @@ class VideoRecorder:
         )
         self._step_n    = 0
         self._label     = ""
+        self._prompt = ""
         self._cam       = mujoco.MjvCamera()
         self._cam.lookat[:]  = [0.45, 0.05, 0.42]
         self._cam.distance   = 1.35
         self._cam.elevation  = -22
         self._cam.azimuth    = 155
-        print(f"[recorder] Initialised → {output_path}  ({w}×{h} @ {RECORD_FPS}fps)")
+        print(f"[recorder] Initialised - {output_path}  ({w}×{h} @ {RECORD_FPS}fps)")
 
     def set_label(self, label: str):
         self._label = label
+
+    def set_prompt(self, prompt: str):
+        self._prompt = prompt
 
     def capture(self, data):
         """Call after every physics step. Writes frame every RECORD_SKIP steps."""
         self._step_n += 1
         if self._step_n % RECORD_SKIP != 0:
             return
+
         self._renderer.update_scene(data, camera=self._cam)
         rgb = self._renderer.render()
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+        # Existing bottom-left stage label
         if self._label:
-            cv2.putText(bgr, self._label,
-                        (20, RECORD_H - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.85,
-                        (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(
+                bgr,
+                self._label,
+                (20, self._h - 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+        # New top-right prompt label
+        if self._prompt:
+            text = f"Prompt: {self._prompt}"
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.55
+            thickness = 2
+
+            text_size, _ = cv2.getTextSize(text, font, scale, thickness)
+            text_w, text_h = text_size
+
+            x = self._w - text_w - 20
+            y = 35
+
+            cv2.putText(
+                bgr,
+                text,
+                (x, y),
+                font,
+                scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA
+            )
+
         self._writer.write(bgr)
 
     def close(self):
@@ -143,7 +169,6 @@ def run_task(
     env:          RecordingSimEnv,
     controller:   RobotController,
     prompt:       str,
-    use_fallback: bool = True,
     save_debug:   bool = True,
 ) -> bool:
 
@@ -152,6 +177,9 @@ def run_task(
     print("═" * 60)
 
     env.set_stage(f"Prompt: {prompt}")
+
+    if env._recorder:
+        env._recorder.set_prompt(prompt)
 
     # ── 1. Parse ──────────────────────────────────────────────────────────
     target_desc, dest_desc = parse_prompt(prompt)
@@ -168,49 +196,54 @@ def run_task(
     # ── 3. Detect ─────────────────────────────────────────────────────────
     env.set_stage("Running perception (Grounding DINO)...")
     print("[pipeline] Running perception ...")
-    detection = detect_objects(rgb, target_desc, dest_desc)
+    try:
+        detection = detect_objects(rgb, target_desc, dest_desc)
+    except Exception as e:
+        print(f"[pipeline] ⚠ Perception error: {e}")
+        from perception import DetectionResult
+        detection = DetectionResult(target_desc=target_desc, dest_desc=dest_desc)
 
     if save_debug and detection.debug_image is not None:
         ts    = int(time.time())
         fname = f"debug_{ts}.png"
         cv2.imwrite(fname, cv2.cvtColor(detection.debug_image, cv2.COLOR_RGB2BGR))
-        print(f"[pipeline] Debug image → {fname}")
+        print(f"[pipeline] Debug image - {fname}")
 
-    # ── 4. 2D → 3D ───────────────────────────────────────────────────────
-    target_world = dest_world = None
-    t_px = d_px = None
+    # ── 4. 2D -> 3D depth geometry ─────────────────────────────────────
+    target_geom = dest_geom = None
 
-    if detection.target_centroid_px and detection.dest_centroid_px:
-        cam_pos, cam_R = get_camera_extrinsics()
-        t_px = detection.target_centroid_px
-        d_px = detection.dest_centroid_px
-        target_world = project_to_table(
-            pixel_to_world(t_px[0], t_px[1], depth, K, cam_pos, cam_R), TABLE_Z)
-        dest_world   = project_to_table(
-            pixel_to_world(d_px[0], d_px[1], depth, K, cam_pos, cam_R), TABLE_Z)
-        print(f"[pipeline] Target world = {target_world}  [perception]")
-        print(f"[pipeline] Dest   world = {dest_world}")
+    if not detection.target_centroid_px or not detection.dest_centroid_px:
+        print("[pipeline] ❌ Detection failed. No hardcoded body/height fallback is used.")
+        return False
 
-    # ── 5. Ground-truth fallback ──────────────────────────────────────────
-    if target_world is None or dest_world is None:
-        if not use_fallback:
-            print("[pipeline] Detection failed and --no-fallback set.")
-            return False
-        print("[pipeline] ⚠ Detection failed — using ground-truth positions.")
-        tb = BODY_NAME_MAP.get((target_desc.colour, target_desc.shape)) or \
-             BODY_NAME_MAP.get((target_desc.colour, None))
-        db = BODY_NAME_MAP.get((dest_desc.colour, dest_desc.shape)) or \
-             BODY_NAME_MAP.get((dest_desc.colour, None))
-        if not tb or not db:
-            print(f"[pipeline] Cannot map to body names.")
-            return False
-        target_world      = env.get_object_position(tb).copy()
-        dest_world        = env.get_object_position(db).copy()
-        target_world[2]   = CUBE_Z
-        dest_world[2]     = BOWL_Z
-        t_px = d_px = None   # no pixels, controller uses fallback TRANSIT_Z
-        print(f"[pipeline] Target = {target_world}  [{tb}]")
-        print(f"[pipeline] Dest   = {dest_world}  [{db}]")
+    cam_pos, cam_R = get_camera_extrinsics()
+    t_px = detection.target_centroid_px
+    d_px = detection.dest_centroid_px
+
+    try:
+        target_geom = estimate_object_from_depth(
+            t_px[0], t_px[1], depth, K, cam_pos, cam_R,
+        )
+        dest_geom = estimate_object_from_depth(
+            d_px[0], d_px[1], depth, K, cam_pos, cam_R,
+        )
+    except ValueError as e:
+        print(f"[pipeline] ❌ Depth geometry failed: {e}")
+        print("[pipeline] No fallback to fixed cube/bowl/table heights is used.")
+        return False
+
+    print(
+        "[pipeline] Target depth geometry: "
+        f"top_xyz={target_geom.top_xyz.round(3)}, "
+        f"support_z={target_geom.support_z:.3f}, "
+        f"height={target_geom.height:.3f}"
+    )
+    print(
+        "[pipeline] Dest depth geometry:   "
+        f"top_xyz={dest_geom.top_xyz.round(3)}, "
+        f"support_z={dest_geom.support_z:.3f}, "
+        f"height={dest_geom.height:.3f}"
+    )
 
     # ── 6. Patch controller to update stage label during execution ────────
     original_log = controller._log
@@ -223,12 +256,7 @@ def run_task(
 
     # ── 7. Execute ────────────────────────────────────────────────────────
     print("[pipeline] Executing pick-and-place ...")
-    success = controller.pick_and_place(
-        target_world, dest_world,
-        target_pixel=t_px,
-        dest_pixel=d_px,
-        depth=depth,
-    )
+    success = controller.pick_and_place(target_geom, dest_geom)
 
     controller._log = original_log
     env.set_stage("Task complete — at home")
@@ -278,8 +306,6 @@ def main():
                         help="Random seed for object placement")
     parser.add_argument("--no-render",   dest="render",
                         action="store_false", default=True)
-    parser.add_argument("--no-fallback", dest="use_fallback",
-                        action="store_false", default=True)
     args = parser.parse_args()
 
     if not args.prompt and not args.demo and not args.interactive:
@@ -300,7 +326,7 @@ def main():
     if args.record:
         recorder = VideoRecorder(env.model, args.output)
         env.attach_recorder(recorder)
-        print(f"[pipeline] Recording enabled → {args.output}")
+        print(f"[pipeline] Recording enabled - {args.output}")
 
     try:
         if args.demo:
@@ -311,7 +337,7 @@ def main():
             for p in prompts:
                 env.reset()
                 env.step(200)
-                run_task(env, controller, p, use_fallback=args.use_fallback)
+                run_task(env, controller, p)
                 # Hold final state for 2s in recording
                 if recorder:
                     for _ in range(0, int(2.0/0.002), RECORD_SKIP):
@@ -323,8 +349,7 @@ def main():
                 env.step(500)
 
         elif args.prompt:
-            run_task(env, controller, args.prompt,
-                     use_fallback=args.use_fallback)
+            run_task(env, controller, args.prompt)
             # After task: drop into interactive loop so window stays open
             print("\n[pipeline] Done. Enter another prompt, or 'quit' to exit.")
             interactive_loop(env, controller)

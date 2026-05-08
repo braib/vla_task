@@ -38,7 +38,7 @@ EEF_SITE     = "eef_site"     # site injected into Panda hand body
 # From panda.xml keyframe: qpos and ctrl for home pose
 HOME_QPOS  = np.array([0, 0, 0, -1.5708, 0, 1.5708, -0.7853, 0.04, 0.04])
 HOME_CTRL  = np.array([0, 0, 0, -1.5708, 0, 1.5708, -0.7853, 255.0])
-# ctrl[7]=255 = fingers OPEN (ctrlrange 0-255, gainprm=0.0157 → 0.04m)
+# ctrl[7]=255 = fingers OPEN (ctrlrange 0-255, gainprm=0.0157 - 0.04m)
 # ctrl[7]=0   = fingers CLOSED
 
 # Arm folded backward — verified: no links above table surface
@@ -117,7 +117,7 @@ def _build_scene(panda_xml_path: str, tmpdir: str) -> str:
 
     <body name="table" pos="0.5 0 0">
       <geom name="table_top" type="box" size="0.4 0.4 0.02"
-            pos="0 0 0.4" rgba="0.55 0.37 0.18 1"
+            pos="0 0 0.4" rgba="1 1 1 1"
             contype="1" conaffinity="1"/>
       <geom type="cylinder" size="0.02 0.2" pos="-0.35 -0.35 0.2" rgba="0.45 0.3 0.15 1"/>
       <geom type="cylinder" size="0.02 0.2" pos=" 0.35 -0.35 0.2" rgba="0.45 0.3 0.15 1"/>
@@ -125,7 +125,7 @@ def _build_scene(panda_xml_path: str, tmpdir: str) -> str:
       <geom type="cylinder" size="0.02 0.2" pos=" 0.35  0.35 0.2" rgba="0.45 0.3 0.15 1"/>
     </body>
 
-    <!-- Overhead camera: euler=0 → optical axis points straight down -->
+    <!-- Overhead camera: euler=0 - optical axis points straight down -->
     <body name="cam_body" pos="0.5 0 1.72">
       <camera name="overhead_cam" fovy="{CAM_FOVY}" pos="0 0 0" euler="0 0 0"/>
     </body>
@@ -212,10 +212,15 @@ class SimEnv:
             self._hand_id = None
             print(f"[SimEnv] EEF site found (id={self._eef_id})")
 
-        if random_seed is not None:
-            self._randomise_objects()
-
+        # reset() first (sets arm to home, calls mj_resetData)
+        # then randomise objects (mj_resetData would undo randomization if done before)
         self.reset()
+        # Always randomise — seed controls reproducibility, None gives a new random scene
+        self._randomise_objects()
+        # Forward pass so data.xpos reflects randomized object positions
+        mujoco.mj_forward(self.model, self.data)
+        # Forward kinematics so data.xpos reflects the new object positions
+        mujoco.mj_forward(self.model, self.data)
         self._renderer = mujoco.Renderer(self.model, height=CAM_H, width=CAM_W)
 
         if render:
@@ -249,44 +254,91 @@ class SimEnv:
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 
-    # Verified robot workspace bounds (IK reachable at grasp height z≈0.47)
-    WORKSPACE_X = (0.26, 0.64)
-    WORKSPACE_Y = (-0.28, 0.28)
-    MIN_OBJECT_SEPARATION = 0.13   # metres, prevents objects overlapping
+    # Object half-footprints (metres) — used to keep objects fully inside workspace
+    _OBJECT_HALF = {"blue_bowl": 0.055, "red_bowl": 0.055,
+                    "red_cube": 0.025, "green_cube": 0.025, "yellow_cube": 0.025}
+
+    # Verified IK-reachable workspace at grasp height (from empirical grid test)
+    # Constrained by Panda reach and joint limits
+    WORKSPACE_X = (0.30, 0.58)
+    WORKSPACE_Y = (-0.25, 0.25)
+
+    # Arm base at origin — additional reach constraint
+    REACH_MIN = 0.28   # metres from base (too close = singular)
+    REACH_MAX = 0.56   # metres from base (too far = joint limits)
+
+    MIN_OBJECT_SEPARATION = 0.12   # centre-to-centre min distance
 
     def _randomise_objects(self):
         """
-        Place objects randomly within the verified robot workspace.
-        X=[0.26, 0.64], Y=[-0.28, 0.28] — IK-reachable region on table top.
-        Uses rejection sampling to ensure minimum separation between objects.
+        Place objects randomly within the IK-reachable workspace.
+        Each object is placed so its FULL FOOTPRINT fits inside the workspace
+        (centre inset by the object's half-footprint from each boundary).
+        Uses distance-from-base reach check as an additional constraint.
         """
         z_map = {"blue_bowl": 0.422, "red_bowl": 0.422}
         placed = []
+        self._object_positions = {}
+
         for name in ["red_cube", "green_cube", "yellow_cube", "blue_bowl", "red_bowl"]:
-            z = z_map.get(name, 0.445)
-            for _ in range(500):   # rejection sampling attempts
-                x = self._rng.uniform(*self.WORKSPACE_X)
-                y = self._rng.uniform(*self.WORKSPACE_Y)
-                pos = np.array([x, y, z])
-                if all(np.linalg.norm(pos[:2] - p[:2]) > self.MIN_OBJECT_SEPARATION
+            z    = z_map.get(name, 0.445)
+            half = self._OBJECT_HALF.get(name, 0.03)
+
+            # Inset workspace bounds by object half-footprint
+            x_lo = self.WORKSPACE_X[0] + half
+            x_hi = self.WORKSPACE_X[1] - half
+            y_lo = self.WORKSPACE_Y[0] + half
+            y_hi = self.WORKSPACE_Y[1] - half
+
+            pos = None
+            for _ in range(2000):   # rejection sampling
+                x = self._rng.uniform(x_lo, x_hi)
+                y = self._rng.uniform(y_lo, y_hi)
+
+                # Reach constraint: distance from arm base (0,0)
+                dist = np.sqrt(x**2 + y**2)
+                if not (self.REACH_MIN <= dist <= self.REACH_MAX):
+                    continue
+
+                candidate = np.array([x, y, z])
+                if all(np.linalg.norm(candidate[:2] - p[:2]) > self.MIN_OBJECT_SEPARATION
                        for p in placed):
+                    pos = candidate
                     placed.append(pos)
                     break
+
+            if pos is None:
+                print(f"[SimEnv] Warning: could not place {name} — keeping XML default")
+                continue
+
+            self._object_positions[name] = pos.copy()
             try:
-                adr = self.model.jnt_qposadr[self.model.joint(name).id]
-                self.data.qpos[adr:adr+3]   = pos
-                self.data.qpos[adr+3:adr+7] = [1, 0, 0, 0]
-            except Exception:
-                pass
+                body_id  = self.model.body(name).id
+                jnt_adr  = self.model.body_jntadr[body_id]
+                qpos_adr = self.model.jnt_qposadr[jnt_adr]
+                self.data.qpos[qpos_adr:qpos_adr+3]   = pos
+                self.data.qpos[qpos_adr+3:qpos_adr+7] = [1, 0, 0, 0]
+            except Exception as e:
+                print(f"[SimEnv] Warning: could not set position for {name}: {e}")
 
     def reset(self):
-        """Teleport arm to home and step physics to settle."""
+        """Reset arm to home. Re-applies object randomization after mj_resetData."""
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:9] = HOME_QPOS
         self.data.ctrl[:8]  = HOME_CTRL   # ctrl[7]=255 = fingers open
         self.data.qvel[:] = 0.0
+        # Re-apply randomized object positions (mj_resetData wipes them to XML defaults)
+        if hasattr(self, '_object_positions') and self._object_positions:
+            for name, pos in self._object_positions.items():
+                try:
+                    body_id  = self.model.body(name).id
+                    jnt_adr  = self.model.body_jntadr[body_id]
+                    qpos_adr = self.model.jnt_qposadr[jnt_adr]
+                    self.data.qpos[qpos_adr:qpos_adr+3]   = pos
+                    self.data.qpos[qpos_adr+3:qpos_adr+7] = [1, 0, 0, 0]
+                except Exception:
+                    pass
         mujoco.mj_forward(self.model, self.data)
-        # 1000 steps gives PD actuators enough time to drive arm to home from any pose
         for _ in range(1000):
             mujoco.mj_step(self.model, self.data)
         if self._viewer is not None and self._viewer.is_running():
@@ -489,8 +541,8 @@ class SimEnv:
         """
         Open or close Panda fingers.
         actuator8 uses ctrlrange=[0,255]:
-          255 → fingers open  (0.04 m each)
-          0   → fingers closed
+          255 - fingers open  (0.04 m each)
+          0   - fingers closed
         Driven via 'split' tendon coupling both finger joints equally.
         """
         ctrl_val = 255.0 if open else 0.0
