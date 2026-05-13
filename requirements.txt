@@ -6,31 +6,20 @@ robot_descriptions>=1.10.0
 mink>=1.1.0
 
 # Perception
-numpy==1.24.0
-scipy>=1.11.0
-groundingdino-py==0.4.0
-
-# Utilities
-Pillow>=10.0.0
-# Core simulation
-mujoco>=3.2.0
-robot_descriptions>=1.10.0
-
-# IK
-mink>=1.1.0
-
-# Perception
 numpy>=1.24.0
 scipy>=1.11.0
+groundingdino-py>=0.4.0
+
+# Utilities
 Pillow>=10.0.0
 
 #API
 google-genai>=1.75.0
 
 transformers==4.30.2
-timm==0.6.13
+# timm==0.6.13
 
 # PyTorch - pinned for GroundingDINO compatibility (CPU-only)
 # Install manually: pip install torch==2.0.1+cpu torchvision==0.15.2+cpu --index-url https://download.pytorch.org/whl/cpu
 # torch==2.0.1
-# torchvision==0.15.2
+torchvision==0.15.2

@@ -205,7 +205,7 @@ def run_task(
 
     if save_debug and detection.debug_image is not None:
         ts    = int(time.time())
-        fname = f"debug_{ts}.png"
+        fname = f"output/debug_{ts}.png"
         cv2.imwrite(fname, cv2.cvtColor(detection.debug_image, cv2.COLOR_RGB2BGR))
         print(f"[pipeline] Debug image - {fname}")
 
